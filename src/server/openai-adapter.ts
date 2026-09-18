@@ -3,7 +3,7 @@
 // StreamChunk span onto the OpenAI completion body. Pure functions — no
 // Fastify imports — so the mapping tables are unit-testable in isolation.
 // New code, not a port. Field decisions follow docs/charter.md §4.2/§4.3.
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { Err, type GatewayConfig } from '../common/types.ts'
 import { parseMirrorCallId } from '../host/recording.ts'
 import { findEntry, resolveModelSlug } from '../host/models.ts'
@@ -396,12 +396,34 @@ export async function mapChatRequest(
     warnings.push('metadata/user/safety_identifier are logged context only — never forwarded upstream')
   }
 
+  // Derive a stable session key from the first non-system message (ADR-7
+  // continuation gap): OpenAI/Anthropic's stateless chat protocols carry no
+  // conversation id, so this is the only value that stays identical across
+  // every turn of one client-side conversation as the array grows, letting
+  // the engine bind an agy --conversation instead of re-digesting history on
+  // every call. Two different conversations whose very first message is
+  // byte-identical would collide and share a binding, so short/generic
+  // openers (test fixtures, "hi", boilerplate) are deliberately excluded —
+  // measured against this project's own test suite, which sends the exact
+  // same one-line opener across unrelated one-shot calls and regressed with
+  // no floor (2 real test failures, both cross-call session bleed). A real
+  // task-shaped first message from an agent client is long enough in
+  // practice that collision risk between genuinely distinct conversations is
+  // low; short/generic first turns just fall back to the pre-fix behavior
+  // (digest-per-call, no binding) rather than risk cross-talk.
+  const SESSION_KEY_MIN_CHARS = 32
+  const firstMessage = messages[0]
+  const sessionKey = firstMessage !== undefined && firstMessage.text.trim().length >= SESSION_KEY_MIN_CHARS
+    ? createHash('sha256').update(firstMessage.role + '\u0000' + firstMessage.text).digest('hex')
+    : undefined
+
   const call: EngineCall = {
     model,
     messages,
     ...(effort !== undefined ? { reasoningEffort: effort } : {}),
     ...(system !== undefined ? { system } : {}),
     ...(jsonSchema !== undefined ? { jsonSchema } : {}),
+    ...(sessionKey !== undefined ? { sessionKey } : {}),
   }
   // stream_options.include_usage: the usage frame rides the end of the SSE
   // stream (choices:[]) instead of the body.

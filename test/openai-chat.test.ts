@@ -122,6 +122,34 @@ describe('mapChatRequest', () => {
     expect(meta.warnings).toEqual([])
   })
 
+  it('derives a sessionKey only once the opening message clears the collision-risk floor (32+ chars)', async () => {
+    // Regression: a naive hash-of-first-message key made ANY two short/
+    // generic openers (this file's own BASE fixture: 'hi') collide and share
+    // an agy conversation binding across unrelated calls — caught by this
+    // suite's own AN6/OA-adjacent fixtures tripping spurious 429s once the
+    // feature first landed. Short openers now fall back to no sessionKey
+    // (pre-fix behavior: digest-per-call, no binding) instead of risking
+    // cross-conversation bleed.
+    const short = await map(BASE) // BASE's opener is 'hi' — below the floor
+    expect(short.call.sessionKey).toBeUndefined()
+
+    const opener = 'I need help refactoring the authentication module to support OAuth2 flows.'
+    const turn1 = await map({ ...BASE, messages: [{ role: 'user', content: opener }] })
+    expect(turn1.call.sessionKey).toMatch(/^[0-9a-f]{64}$/)
+
+    // Same opener, later in the array — the key must stay identical so the
+    // engine's binding lookup on turn 2 finds the conversation turn 1 opened.
+    const turn2 = await map({
+      ...BASE,
+      messages: [
+        { role: 'user', content: opener },
+        { role: 'assistant', content: 'Sure, tell me more.' },
+        { role: 'user', content: 'Use the authorization code flow.' },
+      ],
+    })
+    expect(turn2.call.sessionKey).toBe(turn1.call.sessionKey)
+  })
+
   it('B-M5: staging blanks the body image_url payload but keeps the bytes', async () => {
     const dataUrl = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
     const body = {
